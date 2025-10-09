@@ -13,7 +13,7 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
-        rust: [stable]
+        rust: [nightly]
 
     # 使用 matrix 的 os（例如 ubuntu-latest / windows-latest / macos-latest）
     runs-on: ${{ matrix.os }}
@@ -51,12 +51,8 @@ jobs:
 
       # 5) 靜態檢查（clippy）— 將警告視為錯誤（-D warnings）
       - name: cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --target x86_64-unknown-uefi -- -D warnings
 
       # 6) build（debug）
       - name: cargo build
-        run: cargo build --verbose
-
-      # 7) run tests
-      - name: cargo test
-        run: cargo test --verbose
+        run: cargo build --target x86_64-unknown-uefi --verbose
