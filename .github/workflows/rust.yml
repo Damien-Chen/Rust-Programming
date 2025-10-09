@@ -84,4 +84,4 @@ jobs:
       - name: Run UEFI app in QEMU
         if: runner.os == 'Linux'
         run: |
-          qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/ovmf/OVMF.fd -drive format=raw,file=uefi.img
+          qemu-system-x86_64 -nographic -drive if=pflash,format=raw,readonly=on,file=/usr/share/ovmf/OVMF.fd -drive format=raw,file=uefi.img
