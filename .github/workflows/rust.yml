@@ -49,10 +49,14 @@ jobs:
       - name: cargo fmt (check)
         run: cargo fmt -- --check
 
-      # 5) 靜態檢查（clippy）— 將警告視為錯誤（-D warnings）
+      # 5) Install UEFI target
+      - name: Install UEFI target
+        run: rustup target add x86_64-unknown-uefi
+
+      # 6) 靜態檢查（clippy）— 將警告視為錯誤（-D warnings）
       - name: cargo clippy
         run: cargo clippy --target x86_64-unknown-uefi -- -D warnings
 
-      # 6) build（debug）
+      # 7) build（debug）
       - name: cargo build
         run: cargo build --target x86_64-unknown-uefi --verbose
