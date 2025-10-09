@@ -1,0 +1,62 @@
+name: CI — Rust
+
+# 觸發條件：push 或 pull request 到任何 branch
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  build:
+    # matrix 會在多個 runner 資源與 toolchain 上跑
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        rust: [stable]
+
+    # 使用 matrix 的 os（例如 ubuntu-latest / windows-latest / macos-latest）
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # 1) 取得 repo 程式碼
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2) 快取 cargo registry/git 與 target（加速後續 build）
+      - name: Cache cargo registry, git and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          # key 用 runner/os + rust toolchain + Cargo.lock 的 hash
+          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+
+      # 3) 安裝 Rust toolchain，並同時安裝 clippy 和 rustfmt
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal            # 安裝最小化的 toolchain（節省時間）
+          toolchain: ${{ matrix.rust }}  # stable / beta
+          override: true
+          components: clippy, rustfmt
+
+      # 4) 格式檢查（不自動改 code）— 讓 CI 確保大家的格式一致
+      - name: cargo fmt (check)
+        run: cargo fmt -- --check
+
+      # 5) 靜態檢查（clippy）— 將警告視為錯誤（-D warnings）
+      - name: cargo clippy
+        run: cargo clippy -- -D warnings
+
+      # 6) build（debug）
+      - name: cargo build
+        run: cargo build --verbose
+
+      # 7) run tests
+      - name: cargo test
+        run: cargo test --verbose

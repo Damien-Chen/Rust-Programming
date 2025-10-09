@@ -1,2 +1,2 @@
 # Rust-Programming
-Rust Programming and UEFI
+Rust programming and UEFI
