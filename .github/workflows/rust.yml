@@ -1,6 +1,5 @@
-name: CI — Rust
+name: CI — Rust UEFI
 
-# 觸發條件：push 或 pull request 到任何 branch
 on:
   push:
     branches: ["**"]
@@ -9,21 +8,17 @@ on:
 
 jobs:
   build:
-    # matrix 會在多個 runner 資源與 toolchain 上跑
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest]
         rust: [nightly]
 
-    # 使用 matrix 的 os（例如 ubuntu-latest / windows-latest / macos-latest）
     runs-on: ${{ matrix.os }}
 
     steps:
-      # 1) 取得 repo 程式碼
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2) 快取 cargo registry/git 與 target（加速後續 build）
       - name: Cache cargo registry, git and target
         uses: actions/cache@v4
         with:
@@ -31,57 +26,101 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          # key 用 runner/os + rust toolchain + Cargo.lock 的 hash
           key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             ${{ runner.os }}-cargo-${{ matrix.rust }}-
 
-      # 3) 安裝 Rust toolchain，並同時安裝 clippy 和 rustfmt
       - name: Install Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
-          profile: minimal            # 安裝最小化的 toolchain（節省時間）
-          toolchain: ${{ matrix.rust }}  # stable / beta
+          profile: minimal
+          toolchain: ${{ matrix.rust }}
           override: true
           components: clippy, rustfmt
 
-      # 4) 格式檢查（不自動改 code）— 讓 CI 確保大家的格式一致
       - name: cargo fmt (check)
         run: cargo fmt -- --check
 
-      # 5) Install UEFI target
       - name: Install UEFI target
         run: rustup target add x86_64-unknown-uefi
 
-      # 6) 靜態檢查（clippy）— 將警告視為錯誤（-D warnings）
       - name: cargo clippy
+        # note: clippy may fail for some no_std/uefi setups if clippy can't target it.
         run: cargo clippy --target x86_64-unknown-uefi -- -D warnings
+        # If clippy fails unexpectedly, you can remove the target flag or run clippy on host target only.
 
-      # 7) build（debug）
       - name: cargo build
         run: cargo build --target x86_64-unknown-uefi --verbose
 
-      # 8) Install QEMU for UEFI
-      - name: Install QEMU for UEFI
+      # QEMU + image steps only run on Linux runner (ubuntu-latest)
+      - name: Install QEMU and FAT tools (Linux only)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf
+          # qemu-system-x86 and ovmf provide UEFI firmware
+          sudo apt-get install -y qemu-system-x86 ovmf dosfstools mtools
 
-      # 9) Create UEFI disk image
-      - name: Create UEFI disk image
+      - name: Find built .efi file (Linux)
         if: runner.os == 'Linux'
         run: |
-          dd if=/dev/zero of=uefi.img bs=1M count=10
+          echo "Looking for .efi under target/..."
+          # find the first .efi produced by the target build and print it
+          EFI_PATH=$(find target -type f -name '*.efi' | head -n 1 || true)
+          if [ -z "$EFI_PATH" ]; then
+            echo "No .efi file found in target/ — list target tree for debug:"
+            find target -maxdepth 3 -type f -print || true
+            exit 1
+          fi
+          echo "EFI_PATH=${EFI_PATH}" >> $GITHUB_ENV
+          echo "Found .efi: $EFI_PATH"
+
+      - name: Create UEFI disk image (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          # create a small FAT image and mount it
+          dd if=/dev/zero of=uefi.img bs=1M count=32
+          sudo apt-get install -y dosfstools # ensure mkfs.fat exists (redundant if installed above)
           mkfs.fat -F32 uefi.img
           mkdir -p mnt
-          sudo mount uefi.img mnt
+          sudo mount -o loop uefi.img mnt
           sudo mkdir -p mnt/EFI/BOOT
-          sudo cp target/x86_64-unknown-uefi/debug/main.efi mnt/EFI/BOOT/BOOTX64.EFI
+          # copy the built efi (from previous step)
+          sudo cp "${EFI_PATH}" mnt/EFI/BOOT/BOOTX64.EFI
           sudo umount mnt
+          rm -rf mnt
 
-      # 10) Run UEFI app in QEMU
-      - name: Run UEFI app in QEMU
+      - name: Locate OVMF firmware (Linux)
         if: runner.os == 'Linux'
         run: |
-          qemu-system-x86_64 -nographic -drive if=pflash,format=raw,readonly=on,file=/usr/share/ovmf/OVMF.fd -drive format=raw,file=uefi.img
+          # try to find a suitable OVMF firmware file. prefer CODE.fd if present
+          OVMF_FILE=$(find /usr/share -type f -iname 'OVMF*.fd' -print -quit || true)
+          if [ -z "$OVMF_FILE" ]; then
+            # fallback common paths
+            if [ -f /usr/share/ovmf/OVMF.fd ]; then
+              OVMF_FILE=/usr/share/ovmf/OVMF.fd
+            fi
+          fi
+          if [ -z "$OVMF_FILE" ]; then
+            echo "OVMF firmware file not found. Inspect /usr/share for OVMF files."
+            find /usr/share -iname '*ovmf*' -maxdepth 4 -print || true
+            exit 1
+          fi
+          echo "OVMF_FILE=${OVMF_FILE}" >> $GITHUB_ENV
+          echo "Using OVMF firmware: $OVMF_FILE"
+
+      - name: Run UEFI app in QEMU (Linux)
+        if: runner.os == 'Linux'
+        env:
+          OVMF_FILE: ${{ env.OVMF_FILE }}
+        run: |
+          # Use OVMF as a pflash; map serial to stdio so we can capture UEFI console output
+          # -no-reboot makes QEMU exit instead of continuously rebooting guest
+          qemu-system-x86_64 \
+            -nographic \
+            -machine accel=tcg \
+            -drive if=pflash,format=raw,readonly=on,file="${OVMF_FILE}" \
+            -drive format=raw,file=uefi.img,if=virtio \
+            -serial stdio \
+            -no-reboot \
+            -monitor none
