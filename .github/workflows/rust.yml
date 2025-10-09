@@ -45,82 +45,121 @@ jobs:
         run: rustup target add x86_64-unknown-uefi
 
       - name: cargo clippy
-        # note: clippy may fail for some no_std/uefi setups if clippy can't target it.
         run: cargo clippy --target x86_64-unknown-uefi -- -D warnings
-        # If clippy fails unexpectedly, you can remove the target flag or run clippy on host target only.
 
       - name: cargo build
         run: cargo build --target x86_64-unknown-uefi --verbose
 
-      # QEMU + image steps only run on Linux runner (ubuntu-latest)
-      - name: Install QEMU and FAT tools (Linux only)
+      # QEMU + OVMF only on Linux (ubuntu-latest)
+      - name: Install QEMU and OVMF (Linux only)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # qemu-system-x86 and ovmf provide UEFI firmware
           sudo apt-get install -y qemu-system-x86 ovmf dosfstools mtools
 
       - name: Find built .efi file (Linux)
         if: runner.os == 'Linux'
         run: |
           echo "Looking for .efi under target/..."
-          # find the first .efi produced by the target build and print it
           EFI_PATH=$(find target -type f -name '*.efi' | head -n 1 || true)
           if [ -z "$EFI_PATH" ]; then
             echo "No .efi file found in target/ — list target tree for debug:"
-            find target -maxdepth 3 -type f -print || true
+            find target -maxdepth 5 -type f -print || true
             exit 1
           fi
           echo "EFI_PATH=${EFI_PATH}" >> $GITHUB_ENV
           echo "Found .efi: $EFI_PATH"
 
-      - name: Create UEFI disk image (Linux)
+      - name: Copy OVMF firmware into workspace (Linux)
         if: runner.os == 'Linux'
         run: |
-          set -euo pipefail
-          # create a small FAT image and mount it
-          dd if=/dev/zero of=uefi.img bs=1M count=32
-          sudo apt-get install -y dosfstools # ensure mkfs.fat exists (redundant if installed above)
-          mkfs.fat -F32 uefi.img
-          mkdir -p mnt
-          sudo mount -o loop uefi.img mnt
-          sudo mkdir -p mnt/EFI/BOOT
-          # copy the built efi (from previous step)
-          sudo cp "${EFI_PATH}" mnt/EFI/BOOT/BOOTX64.EFI
-          sudo umount mnt
-          rm -rf mnt
+          # Try common distro locations for OVMF CODE and VARS
+          OVMF_CODE=$(find /usr/share -type f -iname 'ovmf_code.fd' -print -quit || true)
+          OVMF_VARS=$(find /usr/share -type f -iname 'ovmf_vars.fd' -print -quit || true)
 
-      - name: Locate OVMF firmware (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          # try to find a suitable OVMF firmware file. prefer CODE.fd if present
-          OVMF_FILE=$(find /usr/share -type f -iname 'OVMF*.fd' -print -quit || true)
-          if [ -z "$OVMF_FILE" ]; then
-            # fallback common paths
-            if [ -f /usr/share/ovmf/OVMF.fd ]; then
-              OVMF_FILE=/usr/share/ovmf/OVMF.fd
-            fi
+          # fallback: find any OVMF fd and use it as code; vars will be same file if no separate VARS found
+          if [ -z "$OVMF_CODE" ]; then
+            OVMF_CODE=$(find /usr/share -type f -iname 'ovmf*.fd' -print -quit || true)
           fi
-          if [ -z "$OVMF_FILE" ]; then
-            echo "OVMF firmware file not found. Inspect /usr/share for OVMF files."
+          if [ -z "$OVMF_VARS" ]; then
+            OVMF_VARS="$OVMF_CODE"
+          fi
+
+          if [ -z "$OVMF_CODE" ]; then
+            echo "OVMF firmware files not found under /usr/share. Inspecting /usr/share..."
             find /usr/share -iname '*ovmf*' -maxdepth 4 -print || true
             exit 1
           fi
-          echo "OVMF_FILE=${OVMF_FILE}" >> $GITHUB_ENV
-          echo "Using OVMF firmware: $OVMF_FILE"
+
+          cp "$OVMF_CODE" "$GITHUB_WORKSPACE/OVMF_CODE.fd"
+          cp "$OVMF_VARS" "$GITHUB_WORKSPACE/OVMF_VARS.fd"
+          chmod u+w "$GITHUB_WORKSPACE/OVMF_VARS.fd" || true
+          echo "Copied OVMF files to workspace:"
+          ls -l OVMF_CODE.fd OVMF_VARS.fd
+          echo "OVMF_CODE.fd=$(realpath OVMF_CODE.fd)" >> $GITHUB_ENV
+          echo "OVMF_VARS.fd=$(realpath OVMF_VARS.fd)" >> $GITHUB_ENV
+
+      - name: Prepare esp/efi/boot (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          mkdir -p esp/efi/boot
+          # copy the built .efi to the exact path the tutorial expects
+          if [ -z "${EFI_PATH:-}" ]; then
+            echo "EFI_PATH not set"
+            exit 1
+          fi
+          cp "${EFI_PATH}" esp/efi/boot/bootx64.efi
+          ls -l esp/efi/boot/bootx64.efi
 
       - name: Run UEFI app in QEMU (Linux)
         if: runner.os == 'Linux'
         env:
-          OVMF_FILE: ${{ env.OVMF_FILE }}
+          OVMF_CODE: ${{ env.OVMF_CODE.fd }}
+          OVMF_VARS: ${{ env.OVMF_VARS.fd }}
         run: |
-          # Use OVMF as a pflash; map serial to stdio so we can capture UEFI console output
-          # -no-reboot makes QEMU exit instead of continuously rebooting guest
-          qemu-system-x86_64 \
+          set -euo pipefail
+
+          # timeout_seconds should be > your program stall (10s) + boot time margin
+          timeout_seconds=60
+
+          # Use TCG (software) acceleration on Actions runner; map serial->stdio to capture UEFI logs.
+          # Wrap in timeout to avoid CI hanging (adjust timeout as needed).
+          timeout ${timeout_seconds}s qemu-system-x86_64 \
             -nographic \
             -machine accel=tcg \
-            -drive if=pflash,format=raw,readonly=on,file="${OVMF_FILE}" \
-            -drive format=raw,file=uefi.img,if=virtio \
-            -serial stdio \
+            -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd \
+            -drive if=pflash,format=raw,file=OVMF_VARS.fd \
+            -drive format=raw,file=fat:rw:esp \
+            -serial file:serial.log \
             -no-reboot \
-            -monitor none
+            -monitor none || true \
+            -net none
+
+          echo "----- QEMU serial.log (start) -----"
+          # print the captured serial output to the Actions log for immediate debugging
+          if [ -f serial.log ]; then
+            sed -n '1,200p' serial.log || true
+          else
+            echo "(serial.log not found)"
+          fi
+          echo "----- QEMU serial.log (end) -----"
+
+          # assert the expected string; change this to whatever your app prints
+          EXPECTED="Hello world!"
+          if grep -qF "$EXPECTED" serial.log; then
+            echo "Found expected output: '$EXPECTED'"
+          else
+            echo "::error::Expected output not found in QEMU serial output"
+            echo "Full serial.log (for debugging):"
+            sed -n '1,400p' serial.log || true
+            exit 1
+          fi
+
+      - name: Upload QEMU serial log (artifact) (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: qemu-serial-log
+          path: serial.log
+
