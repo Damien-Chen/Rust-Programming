@@ -60,3 +60,28 @@ jobs:
       # 7) build（debug）
       - name: cargo build
         run: cargo build --target x86_64-unknown-uefi --verbose
+
+      # 8) Install QEMU for UEFI
+      - name: Install QEMU for UEFI
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf
+
+      # 9) Create UEFI disk image
+      - name: Create UEFI disk image
+        if: runner.os == 'Linux'
+        run: |
+          dd if=/dev/zero of=uefi.img bs=1M count=10
+          mkfs.fat -F32 uefi.img
+          mkdir -p mnt
+          sudo mount uefi.img mnt
+          sudo mkdir -p mnt/EFI/BOOT
+          sudo cp target/x86_64-unknown-uefi/debug/main.efi mnt/EFI/BOOT/BOOTX64.EFI
+          sudo umount mnt
+
+      # 10) Run UEFI app in QEMU
+      - name: Run UEFI app in QEMU
+        if: runner.os == 'Linux'
+        run: |
+          qemu-system-x86_64 -drive if=pflash,format=raw,readonly=on,file=/usr/share/ovmf/OVMF.fd -drive format=raw,file=uefi.img
