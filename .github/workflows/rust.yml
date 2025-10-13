@@ -36,7 +36,7 @@ jobs:
           profile: minimal
           toolchain: ${{ matrix.rust }}
           override: true
-          components: clippy, rustfmt
+          components: clippy, rustfmt, rust-src
 
       - name: cargo fmt (check)
         run: cargo fmt -- --check
