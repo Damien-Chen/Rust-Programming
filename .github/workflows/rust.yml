@@ -146,7 +146,7 @@ jobs:
           echo "----- QEMU serial.log (end) -----"
 
           # assert the expected string; change this to whatever your app prints
-          EXPECTED="Hello world!"
+          EXPECTED="Image path:"
           if grep -qF "$EXPECTED" serial.log; then
             echo "Found expected output: '$EXPECTED'"
           else
