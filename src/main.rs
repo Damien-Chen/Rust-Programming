@@ -1,94 +1,72 @@
 #![no_main]
 #![no_std]
 
-use log::info;
-use uefi::boot::{self, MemoryType, SearchType}; // MemoryType lives in uefi::boot
+use core::time::Duration;
+use log::{error, info};
 use uefi::prelude::*;
 use uefi::proto::console::gop::GraphicsOutput;
-use uefi::{Identify, Result};
 
 #[entry]
 fn main() -> Status {
-    // initialize logger/panic handler (requires corresponding features in Cargo.toml)
+    // initialise helper plumbing (logger + panic handler hooks provided by the uefi crate features)
     uefi::helpers::init().unwrap();
 
-    // run our demo; map any uefi::Error -> Status using status()
-    match print_gop_info_and_pool_demo() {
-        Ok(()) => Status::SUCCESS,
+    // Try to silence the watchdog (optional, ignore error)
+    let _ = boot::set_watchdog_timer(0, 0, None);
+
+    info!("UEFI GOP demo starting");
+
+    // 1) find a handle implementing the Graphics Output Protocol (GOP)
+    let gop_handle = match boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(h) => h,
+        Err(_) => {
+            error!("GraphicsOutput (GOP) not available on this system");
+            return Status::UNSUPPORTED;
+        }
+    };
+
+    // 2) open the protocol exclusively (ScopedProtocol ensures closure on drop)
+    let mut gop = match boot::open_protocol_exclusive::<GraphicsOutput>(gop_handle) {
+        Ok(g) => g,
         Err(e) => {
-            info!("Error: {:?}", e);
-            e.status() // convert uefi::Error -> Status
+            error!("failed to open GOP: {:?}", e);
+            return Status::DEVICE_ERROR;
         }
-    }
-}
+    };
 
-fn print_gop_info_and_pool_demo() -> Result {
-    // --- DEMO: allocate_pool & free_pool ---
-    {
-        let size: usize = 64;
-        let mem = boot::allocate_pool(MemoryType::LOADER_DATA, size)?;
-        info!("Allocated {} bytes at {:p}", size, mem.as_ptr());
+    // 3) get direct access to the frame buffer
+    let mut fb = gop.frame_buffer();
+    let fb_size = fb.size(); // bytes
 
-        // Safety: allocate_pool returns uninitialized memory; initialize before reading.
-        unsafe {
-            let buf = core::slice::from_raw_parts_mut(mem.as_ptr(), size);
-            for i in 0..size {
-                buf[i] = i as u8;
-            }
-            let print_len = core::cmp::min(16, size);
-            info!(
-                "First {} bytes in the pool: {:?}",
-                print_len,
-                &buf[..print_len]
-            );
-        }
+    info!("framebuffer size = {} bytes", fb_size);
 
-        // free_pool is unsafe, call it inside an unsafe block
-        unsafe {
-            boot::free_pool(mem)?;
-        }
-        info!("Freed the allocated pool at {:p}", mem.as_ptr());
-    }
-    // --- end pool demo ---
+    // 4) write a simple pattern across the framebuffer.
+    //    We write in 4-byte pixel elements (common UEFI modes use 32 bits per pixel).
+    //    This is an unsafe operation because we must obey stride/pixel format; it's OK here
+    //    for a demonstration where we fill the whole buffer with a visible pattern.
+    unsafe {
+        // iterate 4 bytes at a time
+        let mut pixel_index: usize = 0;
+        while pixel_index + 3 < fb_size {
+            // create a simple color pattern (blue, green, red, alpha/reserved)
+            let b = ((pixel_index / 4) & 0xFF) as u8;
+            let g = (((pixel_index / 4) >> 8) & 0xFF) as u8;
+            let r = (((pixel_index / 4) >> 16) & 0xFF) as u8;
+            let a = 0u8; // reserved / alpha byte
 
-    // Find all handles that support the GOP
-    let handles = boot::locate_handle_buffer(SearchType::ByProtocol(&GraphicsOutput::GUID))?;
+            fb.write_byte(pixel_index, b);
+            fb.write_byte(pixel_index + 1, g);
+            fb.write_byte(pixel_index + 2, r);
+            fb.write_byte(pixel_index + 3, a);
 
-    // Iterate through handles. locate_handle_buffer gives you handles you can copy (Handle is Copy).
-    for (idx, handle_ref) in handles.iter().enumerate() {
-        let handle = *handle_ref; // deref the &Handle -> Handle
-        info!("--- GOP device #{} ---", idx);
-
-        // Open the protocol in exclusive mode (safe, returns ScopedProtocol)
-        let gop = match boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
-            Ok(g) => g,
-            Err(e) => {
-                info!(" Failed to open GOP on handle {:?}: {:?}", handle, e);
-                continue;
-            }
-        };
-
-        // Query current mode information
-        let current_info = gop.current_mode_info();
-        let (cur_w, cur_h) = current_info.resolution();
-        let cur_stride = current_info.stride();
-        let cur_pixfmt = current_info.pixel_format();
-        info!(
-            " Current mode: {}x{} stride={} pixel_format={:?}",
-            cur_w, cur_h, cur_stride, cur_pixfmt
-        );
-
-        for (mode_index, mode) in gop.modes().enumerate() {
-            let mi = mode.info();
-            let (w, h) = mi.resolution();
-            let stride = mi.stride();
-            let pixfmt = mi.pixel_format();
-            info!(
-                " Mode {}: {}x{} stride={} pixel_format={:?}",
-                mode_index, w, h, stride, pixfmt
-            );
+            pixel_index += 4;
         }
     }
 
-    Ok(())
+    info!("framebuffer written; pausing so you can see the result");
+
+    // wait 5 seconds (UEFI stall takes microseconds)
+    boot::stall(Duration::from_secs(5));
+
+    Status::SUCCESS
 }

@@ -7,6 +7,15 @@ edition = "2021"
 name = "main"
 path = "src/main.rs"
 
+
 [dependencies]
-log = "0.4.21"
-uefi = { version = "0.35.0", features = [ "panic_handler", "logger" ] }
+log = "0.4"
+
+# uefi crate: enables logger, panic handler, alloc support and a global allocator
+# Check crates.io/docs.rs and pick the latest version if you want (here we use a placeholder).
+uefi = { version = "0.36", features = ["alloc", "global_allocator", "logger", "panic_handler"] }
+
+[profile.release]
+# smaller binary and no debug symbols by default - adjust if you need debugging
+opt-level = "z"
+debug = false
