@@ -122,7 +122,7 @@ fn parse_bmp_to_blt(data: &[u8]) -> Result<(usize, usize, Vec<BltPixel>), &'stat
 
     let width = i32::from_le_bytes(data[18..22].try_into().unwrap());
     let height_raw = i32::from_le_bytes(data[22..26].try_into().unwrap());
-    let height = height_raw.abs() as usize;
+    let height = height_raw.unsigned_abs() as usize;
     let top_down = height_raw < 0;
 
     let planes = u16::from_le_bytes(data[26..28].try_into().unwrap());
@@ -154,7 +154,7 @@ fn parse_bmp_to_blt(data: &[u8]) -> Result<(usize, usize, Vec<BltPixel>), &'stat
         24 => {
             // Rows are padded to a 4-byte boundary
             let row_bytes_unpadded = width_usize * 3;
-            let row_stride = ((row_bytes_unpadded + 3) / 4) * 4;
+            let row_stride = row_bytes_unpadded.div_ceil(4) * 4;
 
             for row in 0..height {
                 // BMP stores rows bottom-up if height positive; compute source row index:
