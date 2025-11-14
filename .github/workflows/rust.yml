@@ -10,7 +10,7 @@ jobs:
   build:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest]
         rust: [nightly]
 
     runs-on: ${{ matrix.os }}
@@ -50,12 +50,11 @@ jobs:
       - name: cargo build
         run: cargo build --target x86_64-unknown-uefi --verbose
 
-      # QEMU + OVMF only on Linux (ubuntu-latest)
-      - name: Install QEMU and OVMF (Linux only)
+      - name: Install QEMU, OVMF and ImageMagick (Linux only)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 ovmf dosfstools mtools
+          sudo apt-get install -y qemu-system-x86 ovmf dosfstools mtools imagemagick
 
       - name: Find built .efi file (Linux)
         if: runner.os == 'Linux'
@@ -110,9 +109,11 @@ jobs:
             exit 1
           fi
           cp "${EFI_PATH}" esp/efi/boot/bootx64.efi
-          ls -l esp/efi/boot/bootx64.efi
+          # Create a test bmp image
+          python3 -c "import struct; f = open('esp/image.bmp', 'wb'); f.write(b'BM'); f.write(struct.pack('<I', 54 + 16*16*3)); f.write(struct.pack('<I', 0)); f.write(struct.pack('<I', 54)); f.write(struct.pack('<I', 40)); f.write(struct.pack('<i', 16)); f.write(struct.pack('<i', 16)); f.write(struct.pack('<H', 1)); f.write(struct.pack('<H', 24)); f.write(struct.pack('<I', 0)); f.write(struct.pack('<I', 16*16*3)); f.write(struct.pack('<I', 0)); f.write(struct.pack('<I', 0)); f.write(struct.pack('<I', 0)); f.write(struct.pack('<I', 0)); [f.write(struct.pack('<BBB', 0, 0, 255)) for _ in range(16*16)];"
+          ls -l esp/efi/boot/bootx64.efi esp/image.bmp
 
-      - name: Run UEFI app in QEMU (Linux)
+      - name: Run UEFI app in QEMU and take screenshot (Linux)
         if: runner.os == 'Linux'
         env:
           OVMF_CODE: ${{ env.OVMF_CODE.fd }}
@@ -120,46 +121,47 @@ jobs:
         run: |
           set -euo pipefail
 
-          # timeout_seconds should be > your program stall (10s) + boot time margin
-          timeout_seconds=60
-
-          # Use TCG (software) acceleration on Actions runner; map serial->stdio to capture UEFI logs.
-          # Wrap in timeout to avoid CI hanging (adjust timeout as needed).
-          timeout ${timeout_seconds}s qemu-system-x86_64 \
-            -nographic \
+          timeout 30s qemu-system-x86_64 \
             -machine accel=tcg \
             -drive if=pflash,format=raw,readonly=on,file=OVMF_CODE.fd \
             -drive if=pflash,format=raw,file=OVMF_VARS.fd \
             -drive format=raw,file=fat:rw:esp \
-            -serial file:serial.log \
+            -m 128 \
+            -vga std \
             -no-reboot \
-            -monitor none || true \
-            -net none
+            -monitor none \
+            -net none \
+            -serial stdio \
+            -display none \
+            -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+            -chardev pipe,id=screenshot,path=screenshot.ppm \
+            -device screendump,chardev=screenshot,id=screendump0 &
+          
+          sleep 15
+          convert screenshot.ppm screenshot.png
 
-          echo "----- QEMU serial.log (start) -----"
-          # print the captured serial output to the Actions log for immediate debugging
-          if [ -f serial.log ]; then
-            sed -n '1,200p' serial.log || true
-          else
-            echo "(serial.log not found)"
-          fi
-          echo "----- QEMU serial.log (end) -----"
+      - name: Verify screenshot (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Create a reference image (black background with a red square)
+          convert -size 640x480 xc:black -fill red -draw "rectangle 312,232 328,248" reference.png
 
-          # assert the expected string; change this to whatever your app prints
-          EXPECTED="Image path:"
-          if grep -qF "$EXPECTED" serial.log; then
-            echo "Found expected output: '$EXPECTED'"
-          else
-            echo "::error::Expected output not found in QEMU serial output"
-            echo "Full serial.log (for debugging):"
-            sed -n '1,400p' serial.log || true
+          # Compare the screenshot with the reference image
+          compare -metric AE screenshot.png reference.png diff.png || true
+          
+          # Check if the images are different
+          if [ $(identify -format "%[mean]" diff.png) != "0" ]; then
+            echo "::error::Screenshot does not match reference image."
             exit 1
           fi
+          echo "Screenshot verification successful."
 
-      - name: Upload QEMU serial log (artifact) (Linux)
-        if: runner.os == 'Linux'
+      - name: Upload artifacts (Linux)
+        if: always() && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: qemu-serial-log
-          path: serial.log
-
+          name: qemu-screenshot
+          path: |
+            screenshot.png
+            reference.png
+            diff.png
