@@ -120,6 +120,7 @@ jobs:
           OVMF_VARS: ${{ env.OVMF_VARS.fd }}
         run: |
           set -euo pipefail
+          touch screenshot.ppm
 
           timeout 30s qemu-system-x86_64 \
             -machine accel=tcg \
